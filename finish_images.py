@@ -36,6 +36,8 @@ ap.add_argument("--line-w", type=float, default=0.0022, help="interaction line w
 ap.add_argument("--ds-lines", action="store_true", help="DS drew its own interaction lines (SHOW_DS_LINES=1) -> do not redraw them")
 ap.add_argument("--res-fmt", default="3+num", help="3+num -> 'ASP 1046'; cap -> 'Asp1046'; raw -> 'ASP1046'")
 ap.add_argument("--only", default="", help="process only this name (e.g. lig1)")
+ap.add_argument("--metal-cut", type=float, default=2.45, help="metal coordination cut-off (A) for N/O donors (S/Cl use +0.35)")
+ap.add_argument("--no-metal", action="store_true", help="do not add metal (Zn ...) coordination contacts")
 a = ap.parse_args()
 
 R, G, B = [int(v) for v in a.carbon.split(",")]
@@ -69,7 +71,18 @@ LEGEND = {   # DS 2D interaction colour -> name   (edit the names here if your D
     "rgb(200,100,255)": "Pi-Sigma",
     "rgb(255,150,0)": "Pi-Cation / Pi-Anion",
     "rgb(255,200,0)": "Pi-Sulfur",
+    "rgb(0,255,255)": "Halogen",
+    "rgb(170,255,0)": "Pi-Lone Pair",
+    "rgb(130,90,180)": "Metal-Acceptor",
 }
+DS_TYPE_COL = [   # interaction type text (lower case, contains) -> colour DS uses in its 2D diagram
+    ("metal", "rgb(130,90,180)"), ("carbon hydrogen", "rgb(220,255,220)"), ("pi-donor", "rgb(220,255,220)"),
+    ("hydrogen", "rgb(0,255,0)"), ("halogen", "rgb(0,255,255)"), ("lone pair", "rgb(170,255,0)"),
+    ("pi-pi", "rgb(255,100,200)"), ("pi pi", "rgb(255,100,200)"), ("sigma", "rgb(200,100,255)"),
+    ("alkyl", "rgb(255,200,255)"), ("cation", "rgb(255,150,0)"), ("anion", "rgb(255,150,0)"), ("charge", "rgb(255,150,0)"),
+    ("salt", "rgb(255,150,0)"), ("sulfur", "rgb(255,200,0)"), ("sulphur", "rgb(255,200,0)"),
+]
+MCOL = "rgb(130,90,180)"            # colour of metal-coordination lines (2D legend / 2D lines)
 LEGEND_KEYS = {   # words searched in the interaction type names exported by DS
     "rgb(0,255,0)": ["hydrogen"], "rgb(220,255,220)": ["carbon hydrogen", "hydrogen"],
     "rgb(255,200,255)": ["alkyl"], "rgb(255,100,200)": ["pi-pi", "pi pi", "stack", "t-shaped"],
@@ -77,25 +90,47 @@ LEGEND_KEYS = {   # words searched in the interaction type names exported by DS
 }
 
 
-def add_legend(src):
+def legend_names(name):
+    """colour -> readable interaction names that really occur in this complex (from the DS table + metal contacts)"""
+    out = {}
+    types = [r.get("type", "") for r in read_tsv(os.path.join(a.folder, name + "_nonbonds.tsv"))]
+    if not a.no_metal and metal_contacts(name)[0]:
+        types.append("Metal-Acceptor")
+    for t in types:
+        tl = t.lower()
+        for k, col in DS_TYPE_COL:
+            if k in tl:
+                nm = re.sub(r"\s*\(.*?\)", "", t).strip()
+                if nm and nm not in out.setdefault(col, []):
+                    out[col].append(nm)
+                break
+    return out
+
+
+def add_legend(src, name=""):
     used = []
     for m in re.finditer(r'<line\b[^>]*stroke:(rgb\([0-9,]+\)); stroke-width:0.05[^>]*/>', src):
         if m.group(1) in LEGEND and m.group(1) not in used:
             used.append(m.group(1))
     if not used:
         return src
+    names = legend_names(name) if name else {}
+    def lname(col):
+        n = names.get(col)
+        txt = " / ".join(n[:3]) if n else LEGEND[col]
+        return txt if len(txt) <= 46 else txt[:44] + "..."
     vb = re.search(r'viewBox="([-\d.eE]+)\s+([-\d.eE]+)\s+([-\d.eE]+)\s+([-\d.eE]+)"', src)
     x0, y0, w, h = [float(v) for v in vb.groups()]
     row = 0.62
     rows_n = (len(used) + 1) // 2 if len(used) > 3 else len(used)
-    colw = 8.2
+    colw = 9.6
     items = ['<text x="%.3f" y="%.3f" font-family="%s" font-size="0.52" font-weight="bold" fill="rgb(0,0,0)">Interactions</text>' % (x0 + 0.3, y0 + h + 0.75, a.font)]
     for i, col in enumerate(used):
         cidx, ridx = (i // rows_n, i % rows_n)
         y = y0 + h + 1.05 + ridx * row
         xx = x0 + 0.3 + cidx * colw
         items.append('<rect x="%.3f" y="%.3f" width="0.42" height="0.42" fill="%s" stroke="rgb(90,90,90)" stroke-width="0.02"/>' % (xx, y, col))
-        items.append('<text x="%.3f" y="%.3f" font-family="%s" font-size="0.46" fill="rgb(0,0,0)">%s</text>' % (xx + 0.65, y + 0.37, a.font, LEGEND[col]))
+        items.append('<text x="%.3f" y="%.3f" font-family="%s" font-size="0.46" fill="rgb(0,0,0)">%s</text>' % (xx + 0.65, y + 0.37, a.font, lname(col)))
     newh = h + 1.3 + rows_n * row
     src = src.replace(vb.group(0), 'viewBox="%s %s %s %.4f"' % (vb.group(1), vb.group(2), vb.group(3), newh), 1)
     return src.replace("</svg>", "".join(items) + "</svg>")
@@ -171,6 +206,8 @@ def add_distances(src, name):
     lines = []
     for m in re.finditer(r'<line\b[^>]*stroke:(rgb\([0-9,]+\)); stroke-width:0.05[^>]*/>', src):
         ln = m.group(0)
+        if m.group(1) == MCOL:
+            continue
         x1, y1, x2, y2 = fnum(ln, "x1"), fnum(ln, "y1"), fnum(ln, "x2"), fnum(ln, "y2")
         best = None
         for cx, cy, rn in named:
@@ -240,6 +277,248 @@ def kekule_inner(src):
         last = m.end()
     out.append(src[last:])
     return "".join(out)
+
+
+
+# =====================================================================================================
+#  METAL COORDINATION (Zn, Mg ...): DS does not list it as a non-bond, so it is computed here from the PDB
+# =====================================================================================================
+METALS = {"ZN", "MG", "MN", "FE", "FE2", "CU", "CU1", "CO", "NI", "CD", "HG", "CA", "MO"}
+WATER = {"HOH", "WAT", "H2O", "TIP", "SOL", "DOD"}
+COV = {"C": 0.76, "N": 0.71, "O": 0.66, "S": 1.05, "P": 1.07, "F": 0.57, "CL": 1.02, "BR": 1.20, "I": 1.39, "H": 0.31}
+_PDB_CACHE = {}
+
+def load_pdb(name):
+    if name in _PDB_CACHE:
+        return _PDB_CACHE[name]
+    f = os.path.join(os.path.dirname(os.path.abspath(a.folder)), "pdb", name + ".pdb")
+    at = []
+    if os.path.isfile(f):
+        for ln in open(f, errors="ignore"):
+            if not ln.startswith(("ATOM", "HETATM")):
+                continue
+            try:
+                xyz = (float(ln[30:38]), float(ln[38:46]), float(ln[46:54]))
+            except ValueError:
+                continue
+            nm = ln[12:16].strip().upper()
+            rn = ln[17:20].strip().upper()
+            el = (ln[76:78].strip() or re.sub(r"[^A-Z]", "", nm)[:1]).upper()
+            if ln.startswith("ATOM") and el in ("CA",):
+                el = "C"
+            at.append({"het": ln.startswith("HETATM"), "name": nm, "rn": rn, "res": rn + ln[22:26].strip(), "el": el, "xyz": xyz,
+                       "alt": ln[16:17].strip()})
+    _PDB_CACHE[name] = at
+    return at
+
+
+def shown_residues(name):
+    return {r["text"].strip().upper() for r in read_tsv(os.path.join(a.folder, name + "_labels.tsv")) if r.get("kind") == "RES"}
+
+
+def wl_hashes(elems, adj, rounds=3):
+    h = {i: elems[i] for i in elems}
+    for _ in range(rounds):
+        h = {i: elems[i] + "(" + ",".join(sorted(h[j] for j in adj[i])) + ")" for i in elems}
+    return h
+
+
+def metal_contacts(name):
+    """-> (rows, ligand_graph).  rows: dict(type, distance, from_xyz (metal), to_xyz (donor), metal, donor_res, donor_el,
+    in_lig, wl (graph hash of the donor inside the ligand))"""
+    if a.no_metal:
+        return [], None
+    atoms = [x for x in load_pdb(name) if x["alt"] in ("", "A")]
+    metals = [x for x in atoms if x["het"] and x["rn"] in METALS]
+    if not metals:
+        return [], None
+    lig = [x for x in atoms if x["het"] and x["rn"] not in METALS and x["rn"] not in WATER and x["el"] != "H"]
+    ligres = {x["res"] for x in lig}
+    shown = shown_residues(name)
+    # ligand covalent graph
+    idx = {id(x): i for i, x in enumerate(lig)}
+    adj = {i: [] for i in range(len(lig))}
+    for i, x in enumerate(lig):
+        for j in range(i + 1, len(lig)):
+            y = lig[j]
+            if x["res"] != y["res"]:
+                continue
+            if math.dist(x["xyz"], y["xyz"]) < COV.get(x["el"], .8) + COV.get(y["el"], .8) + 0.4:
+                adj[i].append(j); adj[j].append(i)
+    elems = {i: x["el"] for i, x in enumerate(lig)}
+    wl = wl_hashes(elems, adj) if lig else {}
+    rows = []
+    for m in metals:
+        for x in atoms:
+            if x is m or x["el"] not in ("N", "O", "S", "CL") or (x["het"] and x["rn"] in METALS):
+                continue
+            cut = a.metal_cut + (0.35 if x["el"] in ("S", "CL") else 0)
+            d = math.dist(m["xyz"], x["xyz"])
+            if d > cut:
+                continue
+            in_lig = x["res"] in ligres
+            if not in_lig and x["res"] not in shown:
+                continue
+            rows.append({"type": "Metal-Acceptor", "distance": "%.2f" % d, "from_xyz": "%.3f,%.3f,%.3f" % m["xyz"],
+                         "to_xyz": "%.3f,%.3f,%.3f" % x["xyz"], "metal": m["res"], "metal_name": m["rn"], "donor_res": x["res"],
+                         "donor_el": x["el"], "in_lig": in_lig, "wl": wl.get(idx.get(id(x)), "") if in_lig else "",
+                         "metal_xyz": m["xyz"]})
+    return rows, lig
+
+
+def metal_2d(src, name):
+    rows, _ = metal_contacts(name)
+    if not rows:
+        return src
+    vb = re.search(r'viewBox="([-\d.eE]+)\s+([-\d.eE]+)\s+([-\d.eE]+)\s+([-\d.eE]+)"', src)
+    vx, vy, vw, vh = [float(v) for v in vb.groups()]
+    ELE = {(R, G, B): "C", (38, 64, 242): "N", (230, 25, 25): "O", (242, 204, 25): "S", (25, 191, 25): "CL", (240, 240, 240): "H"}
+    # --- ligand atoms/bonds from the (already restyled) ligand half-bonds
+    halves = []
+    for m in re.finditer(r"<line\b[^>]*/>", src):
+        ln = m.group(0)
+        if "oid=" not in ln:
+            continue
+        col = re.search(r"stroke:rgb\((\d+),(\d+),(\d+)\)", ln)
+        if not col:
+            continue
+        c = tuple(int(v) for v in col.groups())
+        w = re.search(r"stroke-width:([0-9.]+)", ln)
+        w = float(w.group(1)) if w else 0
+        x1, y1, x2, y2 = fnum(ln, "x1"), fnum(ln, "y1"), fnum(ln, "x2"), fnum(ln, "y2")
+        if None in (x1, y1, x2, y2):
+            continue
+        if c in ELE and w > 0.1:
+            el, ax, ay = ELE[c], x2, y2
+        elif w < 0.05 and c == (218, 187, 255):                 # DS colour of Zn (metal half-bonds)
+            L = math.hypot(x2 - x1, y2 - y1) or 1
+            el, ax, ay = "M", x1 + (x2 - x1) / L * 0.5, y1 + (y2 - y1) / L * 0.5
+        else:
+            continue
+        halves.append((round(x1, 2), round(y1, 2), el, ax, ay, ln))
+    nodes = []          # [x, y, el, [count]]
+    def node_of(x, y, el):
+        for n in nodes:
+            if math.hypot(n[0] - x, n[1] - y) < 0.3 and (n[2] == el or "M" in (n[2], el)):
+                return nodes.index(n)
+        nodes.append([x, y, el]); return len(nodes) - 1
+    bonds = {}
+    for h in halves:
+        bonds.setdefault((h[0], h[1]), []).append(h)
+    edges = set()
+    for k, hs in bonds.items():
+        ids = [node_of(h[3], h[4], h[2]) for h in hs]
+        if len(ids) == 2 and ids[0] != ids[1]:
+            edges.add(tuple(sorted(ids)))
+    mnodes = [i for i, n in enumerate(nodes) if n[2] == "M"]
+    heavy = [i for i, n in enumerate(nodes) if n[2] not in ("M", "H")]
+    adj = {i: [] for i in heavy}
+    for p, q in edges:
+        if p in adj and q in adj:
+            adj[p].append(q); adj[q].append(p)
+    elems = {i: nodes[i][2] for i in heavy}
+    wl2 = wl_hashes(elems, adj) if heavy else {}
+    # --- residue circles (names) for protein donors
+    circ = [(fnum(m.group(0), "cx"), fnum(m.group(0), "cy")) for m in re.finditer(r"<circle\b[^>]*fill=\"url\(#\w+\)\"[^>]*/>", src)]
+    txt = [(fnum(m.group(0), "x"), fnum(m.group(0), "y"), m.group(1).upper() + m.group(2))
+           for m in re.finditer(r'<text\b[^>]*>\s*([A-Za-z0-9]{1,4})\s*</text>\s*<text[^>]*>\s*[A-Za-z0-9]*:(-?\d+[A-Za-z]?)\s*</text>', src)]
+    named = {}
+    for cx, cy in circ:
+        if txt:
+            t = min(txt, key=lambda t: abs(t[0] - cx) + abs(t[1] - cy))
+            if abs(t[0] - cx) + abs(t[1] - cy) < 1.0:
+                named[t[2]] = (cx, cy)
+    out = []
+    removed_m = False
+    used = set()
+    by_metal = {}
+    for r in rows:
+        by_metal.setdefault(r["metal"], []).append(r)
+    lig_cx = sum(nodes[i][0] for i in heavy) / len(heavy) if heavy else vx + vw / 2
+    lig_cy = sum(nodes[i][1] for i in heavy) / len(heavy) if heavy else vy + vh / 2
+    for mres, rs in by_metal.items():
+        # donors in the 2D ligand
+        donors = []
+        for r in rs:
+            if not r["in_lig"]:
+                continue
+            cand = [i for i in heavy if i not in used and nodes[i][2] == r["donor_el"]]
+            exact = [i for i in cand if wl2.get(i) == r["wl"]]
+            near_m = [i for i in (exact or cand) if any(((i, mm) in edges or (mm, i) in edges) for mm in mnodes)]
+            pick = (near_m or exact or cand or [None])[0]
+            if pick is not None:
+                used.add(pick)
+            donors.append((r, pick))
+        # position of the metal circle
+        zpos = None
+        new_circle = False
+        mt = [(fnum(m.group(0), "x"), fnum(m.group(0), "y")) for m in re.finditer(r"<text\b[^>]*oid=[^>]*>\s*%s\s*</text>" % re.escape(rs[0]["metal_name"]), src, re.I)]
+        if mt and len(by_metal) == 1:
+            zpos = (mt[0][0], mt[0][1] + 0.05)
+        elif mnodes and len(by_metal) == 1:
+            zpos = (nodes[mnodes[0]][0], nodes[mnodes[0]][1])
+        metal_in_2d = zpos is not None
+        if zpos is None:
+            pts = [(nodes[p][0], nodes[p][1]) for r, p in donors if p is not None]
+            if pts:
+                dx = sum(p[0] for p in pts) / len(pts); dy = sum(p[1] for p in pts) / len(pts)
+                ux, uy = dx - lig_cx, dy - lig_cy
+                n_ = math.hypot(ux, uy) or 1.0
+                base = math.atan2(uy / n_, ux / n_)
+                others = [v for v in named.values()] + [(nodes[i][0], nodes[i][1]) for i in heavy]
+                best = None
+                for da in (0, 25, -25, 50, -50, 80, -80, 110, -110, 150, -150, 180):
+                    ang = base + math.radians(da)
+                    cand = (dx + math.cos(ang) * 1.55, dy + math.sin(ang) * 1.55)
+                    free = min(math.hypot(cand[0] - o[0], cand[1] - o[1]) for o in others) if others else 9
+                    if best is None or free > best[0]:
+                        best = (free, cand)
+                    if free > 1.25:
+                        break
+                zpos = best[1]
+                new_circle = True
+        if zpos is None:
+            continue
+        # drop DS's own pale Zn bonds (re-drawn below as dashed coordination lines)
+        for h in halves:
+            if metal_in_2d and h[2] == "M" and h[5] in src:
+                src = src.replace(h[5], "", 1); removed_m = True
+        if new_circle:
+            nm = rs[0]["metal_name"].capitalize()
+            out.append('<circle cx="%.4f" cy="%.4f" r="0.46" fill="rgb(218,187,255)" stroke="rgb(60,0,100)" stroke-width="0.02"/>' % zpos)
+            out.append('<text x="%.4f" y="%.4f" font-family="%s" font-size="0.30" font-weight="bold" text-anchor="middle" fill="rgb(0,0,0)">%s</text>' % (zpos[0], zpos[1] - 0.02, a.font, nm.upper()))
+            out.append('<text x="%.4f" y="%.4f" font-family="%s" font-size="0.24" text-anchor="middle" fill="rgb(0,0,0)">A:%s</text>' % (zpos[0], zpos[1] + 0.25, a.font, re.sub(r"\D", "", mres)))
+        targets = []
+        for r, p in donors:
+            if p is not None:
+                targets.append((r, (nodes[p][0], nodes[p][1]), 0.22))
+        for r in rs:
+            if not r["in_lig"]:
+                key = r["donor_res"]
+                if key in named:
+                    targets.append((r, named[key], 0.65))
+        for r, (tx, ty), trim in targets:
+            L = math.hypot(tx - zpos[0], ty - zpos[1]) or 1
+            ux, uy = (tx - zpos[0]) / L, (ty - zpos[1]) / L
+            x0, y0 = zpos[0] + ux * 0.42, zpos[1] + uy * 0.42
+            x1_, y1_ = tx - ux * trim, ty - uy * trim
+            out.append('<line x1="%.4f" y1="%.4f" x2="%.4f" y2="%.4f" style="stroke:%s; stroke-width:0.05;" stroke-dasharray="0.16,0.10" stroke-linecap="round"/>' % (x0, y0, x1_, y1_, MCOL))
+            Lseg = math.hypot(x1_ - x0, y1_ - y0) or 1
+            px_, py_ = -(y1_ - y0) / Lseg, (x1_ - x0) / Lseg
+            if (zpos[0] + px_ * 0.4 - lig_cx) ** 2 + (zpos[1] + py_ * 0.4 - lig_cy) ** 2 < (zpos[0] - px_ * 0.4 - lig_cx) ** 2 + (zpos[1] - py_ * 0.4 - lig_cy) ** 2:
+                px_, py_ = -px_, -py_                      # put the number on the side away from the ligand
+            off = 0.34 if Lseg < 2.0 else 0.0
+            mx, my = (x0 + x1_) / 2 + px_ * off, (y0 + y1_) / 2 + py_ * off
+            base = ('<text x="%.4f" y="%.4f" font-family="%s" font-size="0.44" font-weight="bold" text-anchor="middle" ' % (mx, my + 0.15, a.font))
+            out.append(base + 'fill="rgb(255,255,255)" stroke="rgb(255,255,255)" stroke-width="0.14">%.*f</text>' % (a.dec, float(r["distance"])))
+            out.append(base + 'fill="rgb(90,40,150)">%.*f</text>' % (a.dec, float(r["distance"])))
+        # enlarge the drawing area if the metal circle sits outside
+        x_lo, x_hi, y_lo, y_hi = vx, vx + vw, vy, vy + vh
+        x_lo, x_hi = min(x_lo, zpos[0] - 1.0), max(x_hi, zpos[0] + 1.0)
+        y_lo, y_hi = min(y_lo, zpos[1] - 1.0), max(y_hi, zpos[1] + 1.0)
+        vx, vy, vw, vh = x_lo, y_lo, x_hi - x_lo, y_hi - y_lo
+    src = src.replace(vb.group(0), 'viewBox="%.5f %.5f %.5f %.5f"' % (vx, vy, vw, vh), 1)
+    return src.replace("</svg>", "".join(out) + "</svg>")
 
 
 def clean_svg(src, name=''):
@@ -314,24 +593,15 @@ def clean_svg(src, name=''):
     src = src.replace("</svg>", dots + "</svg>")
     if not a.no_dist:
         src = add_distances(src, name)
+    if not a.no_metal:
+        try:
+            src = metal_2d(src, name)
+        except Exception as e:          # never stop the batch because of the metal step
+            print("   (metal contacts skipped in 2D for %s: %s)" % (name, e))
     if not a.no_legend:
-        src = add_legend(src)
+        src = add_legend(src, name)
     src = src.replace("stroke-width:0.05;", "stroke-width:0.07;")      # slightly thicker interaction dashes
     return src
-
-
-for svg in sorted(glob.glob(os.path.join(a.folder, "*_2D.svg"))):
-    name = os.path.basename(svg)[:-4]
-    if a.only and name[:-3] != a.only:
-        continue
-    tmp = os.path.join(OUT, name + "_tmp.png")
-    src = clean_svg(open(svg, encoding="utf-8").read(), name[:-3])
-    cairosvg.svg2png(bytestring=src.encode("utf-8"), write_to=tmp,
-                     output_width=int(a.width_in * a.dpi * 1.4), background_color="white")
-    im = autocrop(Image.open(tmp))
-    im.save(os.path.join(OUT, name + ".png"), dpi=(a.dpi, a.dpi))
-    os.remove(tmp)
-    print("2D OK", name, im.size)
 
 
 # =====================================================================================================
@@ -356,7 +626,7 @@ def get_font(px):
     return ImageFont.load_default()
 
 # interaction type -> (line/number colour)
-TYPE_COL = [("carbon hydrogen", (60, 160, 110)), ("hydrogen", (0, 160, 0)), ("halogen", (0, 150, 150)),
+TYPE_COL = [("unfavorable", (220, 0, 0)), ("metal", (130, 90, 180)), ("lone pair", (120, 180, 0)), ("carbon hydrogen", (60, 160, 110)), ("hydrogen", (0, 160, 0)), ("halogen", (0, 150, 150)),
             ("pi-pi", (225, 40, 150)), ("pi pi", (225, 40, 150)), ("stack", (225, 40, 150)), ("t-shaped", (225, 40, 150)),
             ("sigma", (140, 50, 210)), ("alkyl", (190, 60, 190)), ("cation", (240, 120, 0)), ("anion", (240, 120, 0)),
             ("charge", (240, 120, 0)), ("electrostatic", (240, 120, 0)), ("sulfur", (200, 160, 0)), ("sulphur", (200, 160, 0)),
@@ -510,6 +780,12 @@ def compose(name, tag, geo, out):
     lw = max(3, a.line_w * W0)
     nbs = read_tsv(os.path.join(a.folder, name + "_nonbonds.tsv"))
     rows = read_tsv(os.path.join(a.folder, name + "_labels.tsv"))
+    mrows, _lg = metal_contacts(name)
+    for r in mrows:
+        nbs.append(r)
+        if not any(x.get("kind") == "RES" and x["text"].strip().upper() == r["metal"] for x in rows):
+            mx_, my_, mz_ = r["metal_xyz"]
+            rows.append({"kind": "RES", "text": r["metal"], "x": str(mx_), "y": str(my_), "z": str(mz_)})
     lig = [r for r in rows if r["kind"] == "LIGAND"]
     res = [r for r in rows if r["kind"] == "RES"]
     lig_uv = proj([float(lig[0]["x"]), float(lig[0]["y"]), float(lig[0]["z"])]) if lig else (W / 2, H / 2)
@@ -606,6 +882,21 @@ def compose(name, tag, geo, out):
     im.save(out, dpi=(a.dpi, a.dpi))
     print("   labelled %s %s  (camera rms %.1f px, %d points, %d residues, %d distances)" % (name, tag, rms, n, len(res), len(segs)))
     return True
+
+
+for svg in sorted(glob.glob(os.path.join(a.folder, "*_2D.svg"))):
+    name = os.path.basename(svg)[:-4]
+    if a.only and name[:-3] != a.only:
+        continue
+    tmp = os.path.join(OUT, name + "_tmp.png")
+    src = clean_svg(open(svg, encoding="utf-8").read(), name[:-3])
+    cairosvg.svg2png(bytestring=src.encode("utf-8"), write_to=tmp,
+                     output_width=int(a.width_in * a.dpi * 1.4), background_color="white")
+    im = autocrop(Image.open(tmp))
+    im.save(os.path.join(OUT, name + ".png"), dpi=(a.dpi, a.dpi))
+    os.remove(tmp)
+    print("2D OK", name, im.size)
+
 
 
 jobs3d = []
